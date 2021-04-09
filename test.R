@@ -4,6 +4,11 @@ packageVersion("rEDM") # 1.8.0, iMacは1.8.1
 
 
 
+# -------------------------------------------------------------------------
+# simplex projectionによる近未来予測 ---------------------------------------------------
+# https://ushio-ecology-blog.blogspot.com/2019/12/20191211blogger0 --------
+# -------------------------------------------------------------------------
+
 # 2種系のデータセットを作成
 d0 <- as.data.frame(matrix(rep(NA,3*1000),ncol=3))
 colnames(d0) <- c("time","x","y")
@@ -147,6 +152,147 @@ simplex(d$y, E = 2,
 #=====　Eを変えて予測精度の変化を見てみる=====#
 simp_res2 <- simplex(d$y, E = 1:10, silent = T)
 plot(simp_res2$E, simp_res2$rmse, type = "b", xlab = "E", ylab = "RMSE", las = 1)
+
+
+
+
+
+# -------------------------------------------------------------------------
+# S-mapによる近未来予測 -----------------------------------------------------------
+# https://ushio-ecology-blog.blogspot.com/2019/12/20191220blogger0 --------
+# -------------------------------------------------------------------------
+#  S-map では全ての点を利用し、その重要性を注目する点からの距離に基づいて重み付けして、かつ局所的な線形モデルを作成することで注目する点の未来を予測する
+
+# rEDM のロード
+library(rEDM)
+packageVersion("rEDM")
+
+# 2種系のデータセットを作成
+d0 <- as.data.frame(matrix(rep(NA,3*1000), ncol=3))
+colnames(d0) <- c("time", "x", "y")
+d0[,1] <- 1:1000
+d0[1,2:3] <- c(0.1, 0.1)
+for(i in 1:999){
+  d0[i+1,2] <- d0[i,2]*(3.8 - 3.80*d0[i,2] - 0.02*d0[i,3])
+  d0[i+1,3] <- d0[i,3]*(3.5 - 0.10*d0[i,2] - 3.50*d0[i,3])
+}
+
+# 最初の 100 time step のデータを捨てる
+d <- d0[100:1000,]
+
+# 2次元で埋め込み
+# y_embed <- make_block(d$y, max_lag = 2)
+y_embed = data.frame(time = rep(1:nrow(d)), col1 = d$y, col1_1 = c(NA, d[1:(nrow(d)-1), "y"]))
+
+# ターゲットの点を指定
+t_target <- 240
+
+# 予測の計算に使うデータを指定
+valid_id <- (1:nrow(y_embed))[-t_target] # 自分自身の点は予測に使わないので除去．timeが返されている？
+valid_id <- valid_id[-1] # 計算上問題なので NA の行を除去．col1_1は1つめのデータがNAだから？
+valid_id <- valid_id[-(length(valid_id))] # 最後のデータはモデル作成に利用できないので除去
+
+# t = 240 の点から各点への距離を計算
+distance <- sqrt(rowSums((y_embed[valid_id,2:3] - c(y_embed[t_target, 2:3]))^2))
+
+# 距離の平均値を計算
+d_mean <- mean(distance, na.rm = TRUE)
+
+# Nonlinear parameter と呼ばれる theta の値を指定
+theta <- 1
+
+# 距離と theta の値に基づき、重みを計算
+weights <- exp(- theta * distance / d_mean)
+
+
+
+
+
+#===== 状態空間上の重みの分布 =====#
+# 状態空間上での重みの分布を可視化
+# グリッド点を生成
+x_grid <- seq(min(y_embed[valid_id,2])-0.05, max(y_embed[valid_id,2])+0.05, by=0.01)
+y_grid <- seq(min(y_embed[valid_id,3])-0.05, max(y_embed[valid_id,3])+0.05, by=0.01)
+x_axis <- rep(x_grid, length(y_grid))
+y_axis <- NULL
+for(i in 1:length(y_grid)) y_axis <- c(y_axis, rep(y_grid[i], length(x_grid)))
+grid_xy <- as.matrix(cbind(x_axis,y_axis))
+
+# グリッドごとにターゲットからの距離を計算
+target_mat <- matrix(rep(as.numeric(y_embed[t_target,2:3]), length(x_axis)), nrow = length(x_axis), byrow = T)
+distance2 <- sqrt(rowSums((grid_xy - target_mat)^2))
+
+# グリッド毎の重みを計算
+grid_dist1 <- exp(- theta * distance2 / d_mean)
+contour_weights1 <- data.frame(cbind(grid_xy, grid_dist1))
+colnames(contour_weights1) <- c("col1", "col1_1", "weights")
+
+# ggplot2 パッケージを用いて状態空間上の重みを可視化
+library(ggplot2)
+packageVersion("ggplot2") # v3.2.1
+
+# 可視化
+ggplot(y_embed[,2:3], aes(x = col1, y = col1_1)) +
+  theme_classic() +
+  geom_tile(data = contour_weights1, aes(x = col1, y = col1_1, fill = weights)) +
+  geom_point(colour = "black", alpha = 0.5, size = 0.8) +
+  scale_fill_gradient2(low = "gray90", mid = "gray90", high = "red3", midpoint = 0.2) +
+  geom_point(aes(x = y_embed[t_target,2], y = y_embed[t_target,3]),
+             size = 2, colour = "white", shape = 4) +
+  xlab("Y(t)") + ylab("Y(t-1)")
+
+
+
+
+#===== 特異値分解を用いて局所重み付け線形回帰を実行 =====#
+# 重みに基づいて局所重み付け線形回帰を実行
+A <- cbind(y_embed[valid_id, 2:3], 1) * weights
+
+# 特異値分解を実行
+A_svd <- svd(A) # 特異値分解
+singular_value <- A_svd$d # 特異値を取り出す
+singular_inv <- diag(1/singular_value, 3, 3) # 行列に変換
+map <- A_svd$v %*% singular_inv %*% t(A_svd$u) %*% (weights * y_embed[valid_id + 1, 2]) # 変換するための写像を計算
+
+# 予測値を計算
+pred <- sum(map * c(as.numeric(y_embed[t_target, 2:3]), 1))
+
+pred
+y_embed[t_target+1, 2]
+
+
+
+#===== rEDM::s_map() による実装 =====#
+# rEDM による実装
+smap_res <- s_map(d$y, E = 2, theta = 1, stats_only = F, silent = T)
+smap_res$model_output[[1]][240,]
+# s_map(time_series,                             # 時系列データ
+#       lib = c(1, NROW(time_series)),           # 埋め込みに使用するデータの範囲
+#       pred = lib,                              # 予測値を出すデータの範囲
+#       norm = 2,                                # 重み付けのための距離の計算方法
+#       E = 1:10,                                # 試行する埋め込み次元の範囲. simplex projectionで決定した値を利用する方法が標準的
+#       tau = 1,                                 # 時間遅れの単位
+#       tp = 1,                                  # 何ステップ先を予測するか
+#       num_neighbors = 0,                       # 使用する最近傍点の数
+#       theta = c(0, 1e-04, 3e-04, 0.001, 0.003, # 試行する theta の値
+#                 0.01, 0.03, 0.1, 0.3, 0.5,
+#                 0.75, 1, 1.5, 2, 3, 4, 6, 8),
+#       stats_only = TRUE,                       # 予測の統計情報のみを出力するのか、それとも予測値も実際に出力するのか
+#       exclusion_radius = NULL,                 # 最近傍点を探す条件として、予測したい点とどの程度時間的に近い点を除くか (数値を指定する)
+#       epsilon = NULL,                          # 最近傍点を探す条件として、予測したい点とどの程度距離的に遠い点を除くか (数値を指定する)
+#       silent = FALSE,                          # Warning message を出力するかどうか
+#       save_smap_coefficients = FALSE)          # S-map の局所重み付け線形回帰の係数を出力に含めるかどうか．予測結果のみに興味があるときはこのオプションは FALSE で問題ない
+
+
+
+
+#===== 非線形性の定量化=====#
+# θ の値は予測における状況依存性 (非線形性) の強さを制御できるため、どのθθ で予測精度 (相関係数、MAE、RMSEなど)が最も良くなるかを調べることで、動態の非線形性の定量が可能です。予測精度が最も良くなる θが大きければ大きいほど、その動態の非線形性は大きい、というわけです。
+
+# theta の値を変えて予測精度をチェック
+smap_res2 <- s_map(d$y, E = 2, silent = T)
+# デフォルトで theta = c(0, 1e-04, 3e-04, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8) となっているので、何も指定しなければ自動的にこれらの theta を試します。
+plot(smap_res2$theta, smap_res2$rmse, type = "b", xlab = "theta", ylab = "RMSE", las = 1)
 
 
 
